@@ -1,0 +1,265 @@
+import hashlib
+import logging
+import os
+import json
+from datetime import datetime
+from functools import wraps
+
+# Настройка логирования
+logging.basicConfig(
+    filename='bank.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    encoding='utf-8'
+)
+
+# Файл для хранения учетных записей
+ACCOUNTS_FILE = "accounts.txt"
+
+
+def load_accounts():
+    """Загружает все учетные записи из файла."""
+    if not os.path.exists(ACCOUNTS_FILE):
+        return {}
+    with open(ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+
+
+def save_accounts(accounts):
+    """Сохраняет учетные записи в файл."""
+    with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(accounts, f, indent=4)
+
+
+def hash_password(password):
+    """Хеширует пароль с помощью SHA-256."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def validate_amount(func):
+    """Декоратор для валидации суммы операции."""
+    @wraps(func)
+    def wrapper(self, amount, *args, **kwargs):
+        if not isinstance(amount, (int, float)) or amount <= 0:
+            raise ValueError("Сумма должна быть положительным числом.")
+        return func(self, amount, *args, **kwargs)
+    return wrapper
+
+
+def validate_pin(func):
+    """Декоратор для проверки пин-кода перед операцией."""
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        if self.is_frozen:
+            raise PermissionError("Счёт заморожен. Обратитесь в поддержку.")
+        if not self._check_pin():
+            raise PermissionError("Неверный пин-код. Доступ запрещён.")
+        return func(self, *args, **kwargs)
+    return wrapper
+
+
+class BankAccount:
+    def __init__(self, user_id, name, pin, balance=0.0):
+        self.user_id = user_id
+        self.name = name
+        self._pin = hash_password(pin)
+        self.balance = balance
+        self.is_frozen = False
+        self._failed_attempts = 0
+
+    def _check_pin(self, pin_input=None):
+        """Проверяет пин-код. Возвращает True при успехе."""
+        if self.is_frozen:
+            return False
+
+        if pin_input is None:
+            pin_input = input("Введите пин-код: ")
+
+        if hash_password(pin_input) == self._pin:
+            self._failed_attempts = 0  # сброс при успешной попытке
+            return True
+        else:
+            self._failed_attempts += 1
+            if self._failed_attempts >= 3:
+                self._freeze_account()
+            return False
+
+    def _freeze_account(self):
+        """Замораживает счёт и меняет пин на '0000'."""
+        self.is_frozen = True
+        self._pin = hash_password("0000")
+        logging.warning(f"Счёт {self.user_id} заморожен после 3 неудачных попыток.")
+        print("⚠️ Счёт заморожен из-за многократных неудачных попыток входа. Новый пин: 0000")
+
+    @validate_amount
+    @validate_pin
+    def deposit(self, amount):
+        """Пополнение счёта."""
+        self.balance += amount
+        message = f"Пополнение счёта {self.user_id} на {amount:.2f}. Новый баланс: {self.balance:.2f}"
+        logging.info(message)
+        print(message)
+
+    @validate_amount
+    @validate_pin
+    def withdraw(self, amount):
+        """Снятие средств."""
+        if amount > self.balance:
+            raise ValueError("Недостаточно средств на счёте.")
+        self.balance -= amount
+        message = f"Снятие с счёта {self.user_id} суммы {amount:.2f}. Новый баланс: {self.balance:.2f}"
+        logging.info(message)
+        print(message)
+
+    @validate_amount
+    @validate_pin
+    def transfer(self, amount, recipient):
+        """Перевод средств на другой счёт."""
+        if not isinstance(recipient, BankAccount):
+            raise TypeError("Получатель должен быть объектом BankAccount.")
+        if amount > self.balance:
+            raise ValueError("Недостаточно средств для перевода.")
+        self.balance -= amount
+        recipient.balance += amount
+        message = (f"Перевод с {self.user_id} на {recipient.user_id} суммы {amount:.2f}. "
+                   f"Баланс отправителя: {self.balance:.2f}, получателя: {recipient.balance:.2f}")
+        logging.info(message)
+        print(message)
+
+    def to_dict(self):
+        """Преобразует объект в словарь для сохранения."""
+        return {
+            "user_id": self.user_id,
+            "name": self.name,
+            "pin_hash": self._pin,
+            "balance": self.balance,
+            "is_frozen": self.is_frozen
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        """Создаёт объект из словаря."""
+        account = cls.__new__(cls)
+        account.user_id = data["user_id"]
+        account.name = data["name"]
+        account._pin = data["pin_hash"]
+        account.balance = data["balance"]
+        account.is_frozen = data["is_frozen"]
+        account._failed_attempts = 0
+        return account
+
+
+class Bank:
+    def __init__(self):
+        self.accounts = {}
+        self._load_accounts_from_file()
+
+    def _load_accounts_from_file(self):
+        """Загружает все счета из файла."""
+        raw_data = load_accounts()
+        for user_id, data in raw_data.items():
+            self.accounts[user_id] = BankAccount.from_dict(data)
+
+    def _save_all_accounts(self):
+        """Сохраняет все счета в файл."""
+        data = {uid: acc.to_dict() for uid, acc in self.accounts.items()}
+        save_accounts(data)
+
+    def create_account(self):
+        """Создаёт новый счёт."""
+        user_id = input("Введите уникальный ID пользователя: ").strip()
+        if user_id in self.accounts:
+            print("❌ Пользователь с таким ID уже существует.")
+            return
+
+        name = input("Введите имя владельца счёта: ").strip()
+        pin = input("Установите 4-значный пин-код: ").strip()
+        if len(pin) != 4 or not pin.isdigit():
+            print("❌ Пин-код должен быть 4 цифры.")
+            return
+
+        account = BankAccount(user_id, name, pin)
+        self.accounts[user_id] = account
+        self._save_all_accounts()
+        logging.info(f"Создан новый счёт: {user_id} ({name})")
+        print(f"✅ Счёт успешно создан для {name} (ID: {user_id})")
+
+    def login(self):
+        """Вход в систему по ID пользователя."""
+        user_id = input("Введите ваш ID: ").strip()
+        if user_id not in self.accounts:
+            print("❌ Пользователь не найден.")
+            return None
+        return self.accounts[user_id]
+
+    def run(self):
+        """Основной цикл банка."""
+        while True:
+            print("\n🏦 Виртуальный Банк")
+            print("1. Создать счёт")
+            print("2. Войти в счёт")
+            print("3. Выйти")
+            choice = input("Выберите действие: ").strip()
+
+            if choice == "1":
+                self.create_account()
+            elif choice == "2":
+                account = self.login()
+                if account:
+                    self._account_menu(account)
+            elif choice == "3":
+                print("👋 До свидания!")
+                break
+            else:
+                print("❌ Неверный выбор.")
+
+    def _account_menu(self, account):
+        """Меню для работы со счётом."""
+        while True:
+            print(f"\n👤 Счёт: {account.name} (ID: {account.user_id})")
+            print(f"💰 Баланс: {account.balance:.2f}")
+            if account.is_frozen:
+                print("🔒 Счёт заморожен!")
+            print("1. Пополнить")
+            print("2. Снять")
+            print("3. Перевести")
+            print("4. Назад")
+            choice = input("Выберите действие: ").strip()
+
+            try:
+                if choice == "1":
+                    amount = float(input("Введите сумму пополнения: "))
+                    account.deposit(amount)
+                    self._save_all_accounts()
+                elif choice == "2":
+                    amount = float(input("Введите сумму снятия: "))
+                    account.withdraw(amount)
+                    self._save_all_accounts()
+                elif choice == "3":
+                    recipient_id = input("ID получателя: ").strip()
+                    if recipient_id not in self.accounts:
+                        print("❌ Получатель не найден.")
+                        continue
+                    recipient = self.accounts[recipient_id]
+                    if recipient == account:
+                        print("❌ Нельзя перевести самому себе.")
+                        continue
+                    amount = float(input("Введите сумму перевода: "))
+                    account.transfer(amount, recipient)
+                    self._save_all_accounts()
+                elif choice == "4":
+                    break
+                else:
+                    print("❌ Неверный выбор.")
+            except ValueError as e:
+                print(f"❌ Ошибка: {e}")
+            except PermissionError as e:
+                print(f"🔒 {e}")
+
+
+if __name__ == "__main__":
+    bank = Bank()
+    bank.run()
